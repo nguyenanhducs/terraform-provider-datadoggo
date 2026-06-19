@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -124,6 +125,16 @@ func TestJSONValidatorValidateStringInvalid(t *testing.T) {
 	v.ValidateString(context.Background(), req, resp)
 	if !resp.Diagnostics.HasError() {
 		t.Error("expected error for invalid JSON")
+	}
+}
+
+func TestJSONValidatorValidateStringNonArrayObject(t *testing.T) {
+	v := jsonValidator{}
+	req := validator.StringRequest{ConfigValue: types.StringValue(`{"not":"an array"}`)}
+	resp := &validator.StringResponse{}
+	v.ValidateString(context.Background(), req, resp)
+	if !resp.Diagnostics.HasError() {
+		t.Error("expected error for valid JSON that is not an array")
 	}
 }
 
@@ -688,6 +699,53 @@ func TestMapResponseToModel_emptyAvailableValuesPreserved(t *testing.T) {
 	}
 }
 
+// TestMapResponseToModel_emptyAvailableValuesMatchedByName verifies that the
+// empty-available_values restore is keyed by template-variable name, so a
+// reordered API response restores the value to the correct variable instead of
+// blindly copying by index.
+func TestMapResponseToModel_emptyAvailableValuesMatchedByName(t *testing.T) {
+	ctx := context.Background()
+	emptyList, _ := types.ListValueFrom(ctx, types.StringType, []string{})
+	nonEmpty, _ := types.ListValueFrom(ctx, types.StringType, []string{"a", "b"})
+
+	// API returns the two variables in the OPPOSITE order from prior state, and
+	// echoes "alpha" with an empty available_values (which parse converts to null).
+	attrs := datadogV1.NotebookResponseDataAttributes{
+		Name:  "Test",
+		Cells: []datadogV1.NotebookCellResponse{},
+		Time:  datadogV1.NotebookRelativeTimeAsNotebookGlobalTime(datadogV1.NewNotebookRelativeTime(datadogV1.WIDGETLIVESPAN_PAST_ONE_HOUR)),
+		AdditionalProperties: map[string]interface{}{
+			"template_variables": []interface{}{
+				map[string]interface{}{"name": "beta", "available_values": []interface{}{"a", "b"}},
+				map[string]interface{}{"name": "alpha", "available_values": []interface{}{}},
+			},
+		},
+	}
+	// Prior state: alpha had an explicit empty list, beta had values.
+	data := &NotebookResourceModel{
+		TemplateVariables: []TemplateVariableModel{
+			{Name: types.StringValue("alpha"), AvailableValues: emptyList},
+			{Name: types.StringValue("beta"), AvailableValues: nonEmpty},
+		},
+	}
+	mapResponseToModel(ctx, attrs, data)
+
+	byName := make(map[string]TemplateVariableModel)
+	for _, tv := range data.TemplateVariables {
+		byName[tv.Name.ValueString()] = tv
+	}
+	alpha, ok := byName["alpha"]
+	if !ok {
+		t.Fatal("expected alpha template variable in result")
+	}
+	if alpha.AvailableValues.IsNull() {
+		t.Error("alpha available_values should be restored to empty list (matched by name), not null")
+	}
+	if len(alpha.AvailableValues.Elements()) != 0 {
+		t.Errorf("alpha available_values should be empty, got %d elements", len(alpha.AvailableValues.Elements()))
+	}
+}
+
 // ---------------------------------------------------------------------------
 // teamsToTagSlice (T005)
 // ---------------------------------------------------------------------------
@@ -1142,7 +1200,7 @@ func loadCellsFixture(t *testing.T) string {
 // Cell fixture tests (T016–T025)
 // ---------------------------------------------------------------------------
 
-// T016: parse all 19 cells.
+// T016: parse all 18 cells.
 func TestCellsFromJSON_fixture(t *testing.T) {
 	cells, err := cellsFromJSON(loadCellsFixture(t))
 	if err != nil {
@@ -1552,6 +1610,29 @@ func TestRetryWait_nonRetryableUsesDefault(t *testing.T) {
 	got := retryWait(resp, delay)
 	if got != delay {
 		t.Errorf("expected default delay %v for 503 without headers, got %v", delay, got)
+	}
+}
+
+func TestRetryWait_capsExcessiveRateLimitReset(t *testing.T) {
+	// A hostile/corrupt X-RateLimit-Reset one year in the future must be clamped.
+	farFuture := time.Now().Add(365 * 24 * time.Hour).Unix()
+	h := http.Header{}
+	h.Set("X-RateLimit-Reset", strconv.FormatInt(farFuture, 10))
+	resp := &http.Response{StatusCode: http.StatusTooManyRequests, Header: h}
+	got := retryWait(resp, time.Second)
+	if got != maxRetryWait {
+		t.Errorf("expected wait clamped to %v, got %v", maxRetryWait, got)
+	}
+}
+
+func TestRetryWait_capsExcessiveRetryAfter(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     http.Header{"Retry-After": []string{"100000"}},
+	}
+	got := retryWait(resp, time.Second)
+	if got != maxRetryWait {
+		t.Errorf("expected wait clamped to %v, got %v", maxRetryWait, got)
 	}
 }
 
