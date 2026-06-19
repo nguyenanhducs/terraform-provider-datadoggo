@@ -72,23 +72,26 @@ type NotebookTimeModel struct {
 type jsonValidator struct{}
 
 func (v jsonValidator) Description(_ context.Context) string {
-	return "value must be a valid JSON string"
+	return "value must be a JSON array of cell objects"
 }
 
 func (v jsonValidator) MarkdownDescription(_ context.Context) string {
-	return "value must be a valid JSON string"
+	return "value must be a JSON array of cell objects"
 }
 
 func (v jsonValidator) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
 	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
 		return
 	}
-	var js json.RawMessage
-	if err := json.Unmarshal([]byte(req.ConfigValue.ValueString()), &js); err != nil {
+	// Require a JSON array specifically. Validating the structure at plan time turns
+	// "valid JSON but wrong shape" (e.g. an object or a string) into a clear config
+	// error instead of an obscure SDK-level failure at apply time.
+	var cells []json.RawMessage
+	if err := json.Unmarshal([]byte(req.ConfigValue.ValueString()), &cells); err != nil {
 		resp.Diagnostics.AddAttributeError(
 			req.Path,
-			"Invalid JSON",
-			fmt.Sprintf("cells must be a valid JSON string: %s", err),
+			"Invalid cells JSON",
+			fmt.Sprintf("cells must be a JSON array of cell objects (use jsonencode([...])): %s", err),
 		)
 	}
 }
@@ -529,6 +532,11 @@ func (r *NotebookResource) ImportState(ctx context.Context, req resource.ImportS
 // apiMaxAttempts is the maximum number of attempts for each API call.
 const apiMaxAttempts = 3
 
+// maxRetryWait caps the per-attempt backoff so a malformed or hostile
+// X-RateLimit-Reset / Retry-After header cannot stall an operation for an
+// unbounded amount of time.
+const maxRetryWait = 60 * time.Second
+
 // callWithRetry executes fn up to apiMaxAttempts times, retrying on 429 and 503.
 // The typed API response is captured by fn via closure.
 func callWithRetry(ctx context.Context, fn func() (*http.Response, error)) (*http.Response, error) {
@@ -572,21 +580,29 @@ func isRetryableStatus(httpResp *http.Response) bool {
 // retryWait returns the duration to wait before the next retry attempt.
 // For 429 responses it honours the X-RateLimit-Reset and Retry-After headers.
 func retryWait(httpResp *http.Response, defaultDelay time.Duration) time.Duration {
+	wait := defaultDelay
 	if httpResp != nil && httpResp.StatusCode == http.StatusTooManyRequests {
+		applied := false
 		if reset := httpResp.Header.Get("X-RateLimit-Reset"); reset != "" {
 			if ts, err := strconv.ParseInt(reset, 10, 64); err == nil {
-				if wait := time.Until(time.Unix(ts, 0)); wait > 0 {
-					return wait
+				if d := time.Until(time.Unix(ts, 0)); d > 0 {
+					wait, applied = d, true
 				}
 			}
 		}
-		if ra := httpResp.Header.Get("Retry-After"); ra != "" {
-			if secs, err := strconv.ParseInt(ra, 10, 64); err == nil {
-				return time.Duration(secs) * time.Second
+		if !applied {
+			if ra := httpResp.Header.Get("Retry-After"); ra != "" {
+				if secs, err := strconv.ParseInt(ra, 10, 64); err == nil {
+					wait = time.Duration(secs) * time.Second
+				}
 			}
 		}
 	}
-	return defaultDelay
+	// Clamp so a corrupted or hostile header value can never stall indefinitely.
+	if wait > maxRetryWait {
+		wait = maxRetryWait
+	}
+	return wait
 }
 
 // --- Helper functions ---
@@ -597,6 +613,10 @@ var cellAttrFields = []string{"graph_size", "split_by", "time"}
 
 // graphSizeSupportedTypes lists definition.type values whose SDK attributes struct
 // has a GraphSize field and whose API will return graph_size in responses.
+//
+// MAINTENANCE: this allowlist must be kept in sync with the Datadog Notebooks API.
+// When Datadog adds graph_size support to a new cell type, add it here — otherwise
+// normalizeCellsForAPI will silently strip graph_size from that type's cells.
 var graphSizeSupportedTypes = map[string]bool{
 	"timeseries":   true,
 	"toplist":      true,
@@ -963,10 +983,17 @@ func mapResponseToModel(ctx context.Context, attrs datadogV1.NotebookResponseDat
 		if len(tvs) > 0 {
 			// When parseTemplateVariables converts an API-echoed empty available_values to
 			// null, but the plan/state had an explicit empty list, restore the prior value
-			// so Terraform doesn't see a null-vs-[] inconsistency.
+			// so Terraform doesn't see a null-vs-[] inconsistency. Match by name rather than
+			// index so a reordered API response restores the correct variable's value.
+			priorAvailByName := make(map[string]types.List, len(priorTVs))
+			for _, p := range priorTVs {
+				priorAvailByName[p.Name.ValueString()] = p.AvailableValues
+			}
 			for i := range tvs {
-				if tvs[i].AvailableValues.IsNull() && i < len(priorTVs) && !priorTVs[i].AvailableValues.IsNull() {
-					tvs[i].AvailableValues = priorTVs[i].AvailableValues
+				if tvs[i].AvailableValues.IsNull() {
+					if prior, ok := priorAvailByName[tvs[i].Name.ValueString()]; ok && !prior.IsNull() {
+						tvs[i].AvailableValues = prior
+					}
 				}
 			}
 			data.TemplateVariables = tvs
