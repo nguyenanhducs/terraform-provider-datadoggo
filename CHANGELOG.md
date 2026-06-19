@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.7](https://github.com/nguyenanhducs/terraform-provider-datadoggo/compare/v0.1.6...v0.1.7) (2026-06-19)
+
+
+### Features
+
+* add permissions for issues and pull requests in workflows ([#46](https://github.com/nguyenanhducs/terraform-provider-datadoggo/issues/46)) ([269bdbf](https://github.com/nguyenanhducs/terraform-provider-datadoggo/commit/269bdbfd34ba3b1467860ff9724d2e94651b6f4d))
+
+
+### Bug Fixes
+
+* harden retry, validation, and state reconciliation ([#53](https://github.com/nguyenanhducs/terraform-provider-datadoggo/issues/53)) ([8f0f79b](https://github.com/nguyenanhducs/terraform-provider-datadoggo/commit/8f0f79b5921dedf1fe44b985292937ef795237a1))
+
 ## [0.1.6](https://github.com/nguyenanhducs/terraform-provider-datadoggo/compare/v0.1.5...v0.1.6) (2026-05-04)
 
 
