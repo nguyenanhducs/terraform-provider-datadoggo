@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/DataDog/datadog-api-client-go/v2/api/datadog"
 	datadogV1 "github.com/DataDog/datadog-api-client-go/v2/api/datadogV1"
@@ -170,7 +171,11 @@ func (p *DatadogProvider) Configure(ctx context.Context, req provider.ConfigureR
 
 	// Validate credentials when validate is true or not explicitly set to false.
 	if data.Validate.IsNull() || data.Validate.ValueBool() {
-		authCtx := context.WithValue(ctx, datadog.ContextAPIKeys, apiKeys)
+		// Bound the validation call so an unreachable API fails fast instead of
+		// hanging until Terraform's global operation timeout.
+		valCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		authCtx := context.WithValue(valCtx, datadog.ContextAPIKeys, apiKeys)
 		if _, _, err := clients.AuthenticationAPI.Validate(authCtx); err != nil {
 			resp.Diagnostics.AddError(
 				"Credential validation failed",
